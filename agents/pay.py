@@ -1,7 +1,7 @@
 """
 An agent that pays for an endpoint it is not allowed to read for free.
 
-    python agent.py --url http://localhost:8402/quote --key 0x<private key>
+    python agents/pay.py --url http://localhost:8402/quote --key 0x<private key>
 
 It calls the endpoint until the free allowance runs out, reads the 402
 challenge, signs an EIP-3009 transfer authorization, and retries the same
@@ -38,7 +38,8 @@ def unb64(value: str):
 
 
 def get(url: str, signature: str | None = None):
-    req = urllib.request.Request(url, method="GET")
+    # Named: urllib's default "Python-urllib/x.y" is refused by many bot filters.
+    req = urllib.request.Request(url, method="GET", headers={"User-Agent": "base-usdc-payments/1.0"})
     if signature:
         req.add_header(HDR_SIGNATURE, signature)
     try:
@@ -158,6 +159,7 @@ def main() -> int:
 
     # 3. Sign and retry the same request.
     payment = sign_base(accepted, args.key)
+    payment["resource"] = ch["resource"]          # optional in the spec, required by facilitators
     status, headers, body = get(args.url, signature=b64(payment))
     print(f"\nretry with payment: {status}")
     if status != 200:

@@ -11,8 +11,8 @@ same request goes through.
     GET /quote  + PAYMENT-SIGNATURE -> 200 + PAYMENT-RESPONSE header (tx hash)
 
 Run:
-    python server.py                # dry-run: signatures verified locally
-    FACILITATOR_URL=... FACILITATOR_API_KEY=... python server.py   # settles
+    python agents/server.py                # dry-run: signatures verified locally
+    FACILITATOR_URL=https://v2.facilitator.mogami.tech X402_PAY_TO=0x... python agents/server.py   # settles
 
 Extracted from the agent layer of helprentdanang.com, reduced to one endpoint.
 """
@@ -45,6 +45,8 @@ CALLS_PER_PAYMENT = int(os.getenv("X402_CALLS_PER_PAYMENT", "5000"))
 TIMEOUT_SECONDS = int(os.getenv("X402_TIMEOUT_SECONDS", "60"))
 FACILITATOR_URL = os.getenv("FACILITATOR_URL", "")
 FACILITATOR_API_KEY = os.getenv("FACILITATOR_API_KEY", "")
+# Named: Coinbase-style bot filters and many facilitators refuse urllib's default.
+USER_AGENT = "base-usdc-payments/1.0"
 
 # In-memory and therefore not production. A real deployment keeps allowance and
 # credit in a store that survives a restart and is shared across workers.
@@ -111,15 +113,16 @@ def bazaar_block() -> dict:
     }
 
 
+def resource_info(resource_url: str) -> dict:
+    return {"url": resource_url, "description": "Median rent quote for one district.",
+            "mimeType": "application/json"}
+
+
 def challenge(resource_url: str, error: str = "") -> str:
     return b64({
         "x402Version": X402_VERSION,
         "error": error or f"{HDR_SIGNATURE} header is required",
-        "resource": {
-            "url": resource_url,
-            "description": "Median rent quote for one district.",
-            "mimeType": "application/json",
-        },
+        "resource": resource_info(resource_url),
         "accepts": [requirements(resource_url)],
         "extensions": {"bazaar": bazaar_block()},
     })
@@ -135,6 +138,7 @@ def _facilitator(path: str, body: dict) -> dict:
         data=json.dumps(body).encode(),
         headers={
             "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
             **({"Authorization": f"Bearer {FACILITATOR_API_KEY}"} if FACILITATOR_API_KEY else {}),
         },
         method="POST",
@@ -216,8 +220,12 @@ def settle(payment: dict, resource_url: str) -> dict:
         signer = verify_locally(payment)
         return {"success": True, "transaction": "", "payer": signer, "dryRun": True}
 
+    # The spec lets a client omit `resource`; facilitators do not. Measured
+    # 2026-09-16 against v2.facilitator.mogami.tech: the same signed payload is
+    # `invalid_payload` without it and `insufficient_funds` with it. It is not
+    # covered by the signature, so filling it in changes nothing the payer signed.
     body = {"x402Version": X402_VERSION,
-            "paymentPayload": payment,
+            "paymentPayload": {**payment, "resource": payment.get("resource") or resource_info(resource_url)},
             "paymentRequirements": requirements(resource_url)}
     verdict = _facilitator("/verify", body)
     if not verdict.get("isValid"):

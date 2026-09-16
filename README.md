@@ -1,28 +1,76 @@
-# A paid HTTP endpoint that agents can actually pay
+# USDC payments on Base, for AI agents and for people
 
-An endpoint that is free up to a daily allowance and, past that line, answers
-**402 with a payment challenge instead of a flat refusal**. The caller signs an
-EIP-3009 transfer authorization, sends it back on the next request, and the same
-request goes through. No API key, no account, no human in the loop.
+Two ways to get paid in USDC on Base mainnet, extracted from a product that runs
+them in production:
 
-Two files, standard library only on the server side.
+1. **Agents pay per request over x402.** An endpoint is free up to a daily
+   allowance and, past that line, answers **402 with a payment challenge instead
+   of a flat refusal**. The agent signs an EIP-3009 transfer authorization and
+   repeats the request; a facilitator submits the transfer and pays the gas.
+2. **People pay from their own wallet.** A checkout shows an EIP-681 QR; any
+   wallet sends an ordinary USDC transfer; the checkout reads the chain and
+   notices. No wallet connection, no processor.
 
-- `server.py` — the paid endpoint: challenge, verify, settle, receipt.
-- `agent.py` — a client that spends the free allowance, reads the challenge,
-  signs, and retries.
+Neither server holds a private key.
 
-Extracted from the agent layer of [helprentdanang.com](https://helprentdanang.com/for-agents/),
-reduced to one endpoint.
+## Live in production
 
-## The flow
+[HelpRent Da Nang](https://helprentdanang.com) is a long-term rental search for
+Da Nang, Vietnam. It runs both flows on Base mainnet, next to the same flows on
+Solana and Arc:
+
+- **Agents:** a REST API and an MCP server ([docs](https://helprentdanang.com/for-agents/)).
+  600 free calls a day, then 402 with offers on Base, Solana and Arc.
+- **People:** renters buy a Search Pass, hosts top up their balance, by scanning
+  a QR in USDC on Base, Solana or Arc.
+
+Paid on Base mainnet on 2026-09-06, from a test wallet, through the production site:
+
+| Flow | What | Transaction |
+| --- | --- | --- |
+| Person | renter buys a Search Pass, 0.10 USDC | [0xd3b859…3255](https://basescan.org/tx/0xd3b859383128e8a11c99aa40826487547b38155ef79bf580d29e3519c95e3255) |
+| Person | host tops up a balance, 0.10 USDC | [0x02eada…9358](https://basescan.org/tx/0x02eada226f6392b592a791cb5750c6f9876b2e170209f599c2d0aa5145909358) |
+| Agent | x402 payment for 5,000 API calls, 0.01 USDC, gas paid by the facilitator | [0x34ee9f…9711](https://basescan.org/tx/0x34ee9f8bd4b1c9d0485be0a07c084391de6aea666290fb0d3752bc99cdd49711) |
+
+The production code is a private Django service. This repository is its payment
+layer, reduced to standard-library Python.
+
+## Layout
+
+```
+agents/server.py       x402 paid endpoint: challenge, verify, settle, receipt
+agents/pay.py          an agent: spends the free allowance, signs, retries
+agents/test_guards.py  what the endpoint refuses, against a running server
+base.py                what the checkout needs: RPC, reading USDC Transfer logs, sending one
+people/checkout.py     QR checkout: unique amount, EIP-681 link, reads Base for the transfer
+people/pay.py          pays the checkout from a script, the way a wallet would
+tests/                 offline checks of the checkout
+```
+
+```bash
+pip install -r requirements.txt
+python -m unittest discover -s tests
+
+# agents: dry run, signatures verified locally, nothing settled
+python agents/server.py
+python agents/pay.py --key 0x<throwaway private key>
+
+# agents: settle for real
+FACILITATOR_URL=https://v2.facilitator.mogami.tech X402_PAY_TO=0xYourAddress python agents/server.py
+
+# people
+PAY_TO=0xYourAddress python people/checkout.py        # open http://localhost:8403/
+PAYER_KEY=0x... python people/pay.py --price 0.10
+```
+
+## Flow 1: agents, x402 with EIP-3009
 
 ```mermaid
 sequenceDiagram
     participant A as Agent
-    participant S as Server
+    participant S as agents/server.py
     participant F as Facilitator
     participant C as Base
-
     A->>S: GET /quote
     S-->>A: 200 + X-RateLimit-Remaining
     Note over A,S: allowance runs out
@@ -34,47 +82,11 @@ sequenceDiagram
     F-->>S: valid
     S->>F: settle
     F->>C: transferWithAuthorization
-    C-->>F: tx hash
     F-->>S: tx hash
     S-->>A: 200 + PAYMENT-RESPONSE (tx hash) + the data
 ```
 
-## Run it
-
-```bash
-pip install eth-account          # the agent needs it; the server only for dry-run verification
-python server.py                 # dry run: signatures verified locally, nothing settled
-python agent.py --key 0x<throwaway private key>
-```
-
-Real output from a dry run, free allowance set to 2:
-
-```
-call 1: 200, free calls left: 1
-call 2: 200, free calls left: 0
-call 3: 402 — allowance spent
-
-challenge: 10000 units of 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
-           on eip155:8453 to 0x000000000000000000000000000000000000dEaD
-           discovery: {"type": "http", "method": "GET", "queryParams": {"district": "string, optional"}}
-  signed as 0x1d18d2d1a23B20E4B8f576feAD1b0eF805808811
-
-retry with payment: 200
-receipt: success=True payer=0x1d18d2d1a23B20E4B8f576feAD1b0eF805808811 — DRY RUN, nothing settled
-```
-
-To settle for real, point it at a facilitator:
-
-```bash
-FACILITATOR_URL=https://api.cdp.coinbase.com/platform/v2/x402 \
-FACILITATOR_API_KEY=... \
-X402_PAY_TO=0xYourReceivingAddress \
-python server.py
-```
-
-## What it refuses
-
-`python test_guards.py` against a running server, all six verified:
+`python agents/test_guards.py` against a running dry-run server:
 
 ```
 [ok] a valid payment is accepted: 200
@@ -85,47 +97,66 @@ python server.py
 [ok] a malformed header is a 402, not a 500: PAYMENT-SIGNATURE is not base64 JSON
 ```
 
-## The decisions worth arguing about
+The decisions worth arguing about:
 
-**No private key on the application server.** The facilitator is the only party
-that needs one, and it cannot change the amount or the recipient because both
-are inside the signature it relays. The server signs nothing and holds nothing.
+- **No private key on the application server.** The facilitator is the only
+  party that needs one, and it cannot change the amount or the recipient because
+  both are inside the signature it relays.
+- **Verify, then settle.** Settling a payload that would not verify burns the
+  facilitator's gas for an error nobody can explain afterwards.
+- **A block of calls, not a call.** One payment buys thousands of requests;
+  settling per request would put a chain write between an agent and every read.
+- **Amounts are strings.** Six-decimal USDC in a float is a rounding bug waiting
+  for the first amount that ends in a 5.
+- **The EIP-712 domain comes from the challenge**, never from a local constant.
+- **Discovery lives inside the 402.** There is no `/.well-known/x402`; the
+  `bazaar` extension describes the call shape.
+- **`resource` is sent to the facilitator even when the client left it out.**
+  The spec makes it optional; `v2.facilitator.mogami.tech` does not. Measured on
+  2026-09-16: the same signed payload is `invalid_payload` without it and
+  `insufficient_funds` (the honest answer for an empty wallet) with it.
 
-**Verify, then settle. Two calls, on purpose.** Settling a payload that would
-not verify burns the facilitator's gas for an error nobody can explain
-afterwards.
+## Flow 2: people, a QR and an ordinary transfer
 
-**A block of calls, not a call.** One payment buys thousands of requests.
-Settling per request would put a chain write between an agent and every single
-read, which is the wrong shape for anything an agent does in a loop.
+```mermaid
+sequenceDiagram
+    participant P as Person's wallet
+    participant K as people/checkout.py
+    participant C as Base
+    K-->>P: QR: ethereum:0x8335…2913@8453/transfer?address=…&uint256=100000
+    P->>C: USDC transfer (gas in ETH)
+    loop every 5 s while the page is open
+        K->>C: eth_getLogs, USDC Transfer to PAY_TO
+    end
+    K-->>P: paid (one transfer grants one reservation)
+```
 
-**Amounts are strings.** The spec says so, and six-decimal USDC in a float is a
-rounding bug waiting for the first amount that ends in a 5.
+- **The amount is the identifier.** Each open reservation gets a price no other
+  one holds, one cent apart. No memo to forget, no address per payment.
+- **The chain id is in the QR.** `@8453` makes a wallet switch to Base; USDC sent
+  to the same address on another chain is the classic unrecoverable mistake.
+- **Only the USDC contract's logs count.** Any contract can emit an event named
+  `Transfer`.
+- A payer who closed the page posts the hash to `/confirm/<id>`; the receipt is
+  read, the request is trusted for nothing.
 
-**The EIP-712 domain comes from the challenge, never from a local constant.**
-The name and version belong to the token contract. Wrong ones produce a
-signature that verifies against nothing while looking like the client's fault.
+## Things that cost time
 
-**Discovery lives inside the 402.** There is no `/.well-known/x402` in the
-specification. The `bazaar` extension is how a paid endpoint describes its own
-call shape so a facilitator that finds the challenge learns more than the price.
+- Many bot filters, the production site's included, answer **403 to urllib's
+  default User-Agent**. Every request here names its own.
+- Public Base nodes refuse wide `eth_getLogs` ranges; the checkout asks for 450
+  blocks, which covers its 15-minute window at 2 s a block.
 
-**Header values are base64 with no newlines.** `b64encode` does not wrap;
-`encodebytes` does, and a newline inside a header value is a request-splitting
-bug, not a formatting quirk.
+## Not here
 
-## What this does not do
-
-- **It is not production.** Allowance, credit and spent nonces live in process
-  memory. A restart forgets every payment; two workers do not share state.
-- **It does not check that the payer can pay.** Dry-run mode recovers the signer
-  and validates the authorization. It does not read balances or allowances, and
-  it does not spend anything on chain. Only the facilitator does that.
-- **One rail.** EVM and the `exact` scheme. No Solana, no other schemes.
-- **No refunds, no disputes, no reconciliation.** A settlement that times out
-  halfway is not recovered here; in a real deployment that is the hard part.
-- **The data is illustrative.** The endpoint returns a made-up rent figure. This
-  repository is about the payment protocol, not about the data behind it.
+- Persistence. Allowances, credits, reservations and spent nonces live in
+  memory; production keeps them in a database with a unique index on the
+  transaction.
+- Reconciliation of a settlement that times out halfway. In production that is
+  the hard part.
+- Solana and Arc. The same two flows on those chains:
+  [solana-usdc-payments](https://github.com/PaulBurgEth/solana-usdc-payments) and
+  [arc-usdc-payments](https://github.com/PaulBurgEth/arc-usdc-payments).
 
 ## Licence
 

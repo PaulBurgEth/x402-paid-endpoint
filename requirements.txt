@@ -1,0 +1,2 @@
+eth-account==0.13.7   # signing, for the payer scripts and dry-run verification
+segno==1.6.6          # optional: QR codes on the checkout page
