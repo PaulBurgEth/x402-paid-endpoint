@@ -1,8 +1,7 @@
 """
 An agent that pays for an endpoint it is not allowed to read for free.
 
-    python agent.py --url http://localhost:8402/quote            # key from PAYER_KEY
-    python agent.py --network eip155:5042                         # pay on Arc
+    python agent.py --url http://localhost:8402/quote --key 0x<private key>
 
 It calls the endpoint until the free allowance runs out, reads the 402
 challenge, signs an EIP-3009 transfer authorization, and retries the same
@@ -10,18 +9,13 @@ request with the signature attached. Nothing here talks to a chain: the payer
 signs, the facilitator broadcasts. That is the point of the scheme — the payer
 spends no gas, and the server never holds a key.
 
-Use a throwaway key. A private key on a command line ends up in shell history,
-so PAYER_KEY in the environment is read first and --key is the fallback.
-
-On Arc the payment is a Circle Gateway nanopayment: deposit USDC into Gateway
-once (gateway_deposit.py), and every payment after that is a signature only.
+Use a throwaway key. A private key on a command line ends up in shell history.
 """
 from __future__ import annotations
 
 import argparse
 import base64
 import json
-import os
 import secrets
 import sys
 import time
@@ -44,10 +38,7 @@ def unb64(value: str):
 
 
 def get(url: str, signature: str | None = None):
-    # Named: urllib's default "Python-urllib/x.y" is refused with 403 by common
-    # bot filters, including the production deployment of this endpoint.
-    req = urllib.request.Request(url, method="GET",
-                                 headers={"User-Agent": "x402-paid-endpoint/1.1"})
+    req = urllib.request.Request(url, method="GET")
     if signature:
         req.add_header(HDR_SIGNATURE, signature)
     try:
@@ -64,10 +55,6 @@ def sign_base(accepted: dict, key: str) -> dict:
     constant: the name and version belong to the token contract, and wrong ones
     produce a signature that verifies against nothing while looking like a
     client bug.
-
-    When `extra` names a verifyingContract (Circle Gateway on Arc), the
-    signature is for that contract, not for the token. The window then follows
-    maxTimeoutSeconds, which Gateway sets to at least seven days.
     """
     try:
         from eth_account import Account
@@ -109,7 +96,7 @@ def sign_base(accepted: dict, key: str) -> dict:
             "name": accepted["extra"]["name"],
             "version": accepted["extra"]["version"],
             "chainId": int(accepted["network"].split(":")[1]),
-            "verifyingContract": accepted["extra"].get("verifyingContract", accepted["asset"]),
+            "verifyingContract": accepted["asset"],
         },
         "message": {
             "from": authorization["from"],
@@ -136,10 +123,7 @@ def sign_base(accepted: dict, key: str) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://localhost:8402/quote")
-    ap.add_argument("--key", help="payer private key (prefer PAYER_KEY in the environment); "
-                                  "omit both to stop at the challenge")
-    ap.add_argument("--network", help="CAIP-2 network of the entry to pay, e.g. eip155:5042; "
-                                      "default: the first entry")
+    ap.add_argument("--key", help="payer private key; omit to stop at the challenge")
     ap.add_argument("--max-free", type=int, default=10)
     args = ap.parse_args()
 
@@ -161,31 +145,19 @@ def main() -> int:
         print("402 without a PAYMENT-REQUIRED header: the paid rail is not configured")
         return 1
     ch = unb64(raw)
-    print("\noffered: " + ", ".join(a["network"] for a in ch["accepts"]))
-    if args.network:
-        match = [a for a in ch["accepts"] if a["network"] == args.network]
-        if not match:
-            print(f"{args.network} is not offered by this endpoint")
-            return 1
-        accepted = match[0]
-    else:
-        accepted = ch["accepts"][0]
+    accepted = ch["accepts"][0]
     print(f"\nchallenge: {accepted['amount']} units of {accepted['asset']}")
     print(f"           on {accepted['network']} to {accepted['payTo']}")
     print(f"           resource: {ch['resource']['url']}")
     if "extensions" in ch:
         print(f"           discovery: {json.dumps(ch['extensions']['bazaar']['info']['input'])}")
 
-    key = os.getenv("PAYER_KEY") or args.key
-    if not key:
-        print("\nno PAYER_KEY and no --key, stopping at the challenge.")
+    if not args.key:
+        print("\nno --key given, stopping at the challenge.")
         return 0
 
     # 3. Sign and retry the same request.
-    payment = sign_base(accepted, key)
-    # Echo the resource from the challenge. The spec allows leaving it out;
-    # Circle Gateway does not.
-    payment["resource"] = ch["resource"]
+    payment = sign_base(accepted, args.key)
     status, headers, body = get(args.url, signature=b64(payment))
     print(f"\nretry with payment: {status}")
     if status != 200:
@@ -195,12 +167,7 @@ def main() -> int:
     receipt = headers.get(HDR_RESPONSE)
     if receipt:
         r = unb64(receipt)
-        if r.get("dryRun"):
-            where = "DRY RUN, nothing settled"
-        elif r.get("network") == "eip155:5042":
-            where = f"Gateway transfer {r.get('transaction')} (batched onto Arc)"
-        else:
-            where = f"tx {r.get('transaction')}"
+        where = "DRY RUN, nothing settled" if r.get("dryRun") else f"tx {r.get('transaction')}"
         print(f"receipt: success={r.get('success')} payer={r.get('payer')} — {where}")
     print(f"body: {body.decode()[:200]}")
     return 0
