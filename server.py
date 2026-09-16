@@ -10,6 +10,9 @@ same request goes through.
     GET /quote  (allowance spent)   -> 402 + PAYMENT-REQUIRED header
     GET /quote  + PAYMENT-SIGNATURE -> 200 + PAYMENT-RESPONSE header (tx hash)
 
+Two rails in one challenge: USDC on Base through any x402 facilitator, and USDC
+on Arc through Circle Gateway nanopayments (ARC_ENABLED=1).
+
 Run:
     python server.py                # dry-run: signatures verified locally
     FACILITATOR_URL=... FACILITATOR_API_KEY=... python server.py   # settles
@@ -45,6 +48,22 @@ CALLS_PER_PAYMENT = int(os.getenv("X402_CALLS_PER_PAYMENT", "5000"))
 TIMEOUT_SECONDS = int(os.getenv("X402_TIMEOUT_SECONDS", "60"))
 FACILITATOR_URL = os.getenv("FACILITATOR_URL", "")
 FACILITATOR_API_KEY = os.getenv("FACILITATOR_API_KEY", "")
+# Named, because Circle Gateway answers 403 to urllib's default "Python-urllib/x.y"
+# (measured 2026-09-16) while it serves curl and python-requests.
+USER_AGENT = "x402-paid-endpoint/1.1"
+
+# --- Arc, through Circle Gateway ---------------------------------------------
+# Arc mainnet is chain 5042 and USDC is its native gas token; 0x3600...0000 is
+# the ERC-20 view of that same balance, in 6 decimals. On the day Arc mainnet
+# launched, the only x402 facilitator that settled it was Circle Gateway, and it
+# settles its own flavour of `exact`: the payer signs EIP-3009 against the
+# GatewayWallet contract (domain "GatewayWalletBatched"), spends a balance
+# deposited there beforehand, and the seller is credited inside Gateway by a
+# batched settlement. Nothing goes on chain per call, and nobody pays gas for it.
+ARC_ENABLED = os.getenv("ARC_ENABLED", "") in ("1", "true", "yes")
+ARC_NETWORK = os.getenv("ARC_NETWORK", "eip155:5042")
+ARC_USDC = os.getenv("ARC_USDC", "0x3600000000000000000000000000000000000000")
+ARC_GATEWAY_URL = os.getenv("ARC_GATEWAY_URL", "https://gateway-api.circle.com/v1/x402")
 
 # In-memory and therefore not production. A real deployment keeps allowance and
 # credit in a store that survives a restart and is shared across workers.
@@ -94,6 +113,76 @@ def requirements(resource_url: str) -> dict:
     }
 
 
+_gateway_rows: dict = {}
+
+
+def gateway_row(network: str) -> dict:
+    """Gateway's own /supported row for a network, or {}.
+
+    Read, not configured: the GatewayWallet address, the EIP-712 domain and the
+    minimum signature lifetime belong to Circle, and a stale copy yields
+    signatures Gateway refuses. A failure is not remembered, so an outage does
+    not close the rail until restart.
+    """
+    if network in _gateway_rows:
+        return _gateway_rows[network]
+    try:
+        req = urllib.request.Request(ARC_GATEWAY_URL.rstrip("/") + "/supported",
+                                     headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            kinds = json.loads(r.read()).get("kinds") or []
+    except Exception as e:
+        print(f"  gateway /supported unreachable: {e}")
+        return {}
+    row = next((k for k in kinds if k.get("network") == network
+                and (k.get("extra") or {}).get("name") == "GatewayWalletBatched"), {})
+    _gateway_rows[network] = row
+    return row
+
+
+def arc_requirements() -> dict | None:
+    """The Arc entry, or None. No entry unless Gateway lists this network with
+    this USDC contract: a challenge nobody can settle strands the payer."""
+    if not ARC_ENABLED:
+        return None
+    extra = gateway_row(ARC_NETWORK).get("extra") or {}
+    if ARC_USDC.lower() not in {a.get("address", "").lower() for a in extra.get("assets", [])}:
+        return None
+    return {
+        "scheme": "exact",
+        "network": ARC_NETWORK,
+        "amount": str(int(PRICE_UNITS)),
+        "asset": ARC_USDC,
+        "payTo": PAY_TO,
+        # Gateway refuses an authorization valid for less than minValiditySeconds
+        # (seven days on mainnet). Circle's own example adds 100 seconds of slack.
+        "maxTimeoutSeconds": max(TIMEOUT_SECONDS, int(extra.get("minValiditySeconds", 0)) + 100),
+        "extra": {"name": extra["name"], "version": extra["version"],
+                  "verifyingContract": extra["verifyingContract"]},
+    }
+
+
+def accepts(resource_url: str) -> list:
+    """Every rail we can settle. A client picks the chain it holds funds on."""
+    out = [requirements(resource_url)]
+    arc = arc_requirements()
+    if arc:
+        out.append(arc)
+    return out
+
+
+def chosen(payment: dict, resource_url: str) -> dict:
+    """The entry the client signed for, matched on the fields that identify a
+    rail. Settling against a different entry than the one signed gets a refusal
+    about the wrong thing."""
+    got = payment.get("accepted") or {}
+    for entry in accepts(resource_url):
+        if all(str(got.get(k, "")).lower() == str(entry[k]).lower()
+               for k in ("scheme", "network", "asset", "payTo")):
+            return entry
+    raise Refused("the accepted block matches nothing this endpoint offers")
+
+
 def bazaar_block() -> dict:
     """Discovery. There is no /.well-known/x402 in the specification, so a paid
     endpoint describes its own call shape inside the 402 and facilitators
@@ -111,16 +200,18 @@ def bazaar_block() -> dict:
     }
 
 
+def RESOURCE_INFO(resource_url: str) -> dict:
+    # All three fields: Gateway rejects a resource without description or mimeType.
+    return {"url": resource_url, "description": "Median rent quote for one district.",
+            "mimeType": "application/json"}
+
+
 def challenge(resource_url: str, error: str = "") -> str:
     return b64({
         "x402Version": X402_VERSION,
         "error": error or f"{HDR_SIGNATURE} header is required",
-        "resource": {
-            "url": resource_url,
-            "description": "Median rent quote for one district.",
-            "mimeType": "application/json",
-        },
-        "accepts": [requirements(resource_url)],
+        "resource": RESOURCE_INFO(resource_url),
+        "accepts": accepts(resource_url),
         "extensions": {"bazaar": bazaar_block()},
     })
 
@@ -129,13 +220,15 @@ class Refused(Exception):
     pass
 
 
-def _facilitator(path: str, body: dict) -> dict:
+def _facilitator(path: str, body: dict, base: str = "", key: str = "") -> dict:
+    base, key = (base, key) if base else (FACILITATOR_URL, FACILITATOR_API_KEY)
     req = urllib.request.Request(
-        FACILITATOR_URL.rstrip("/") + path,
+        base.rstrip("/") + path,
         data=json.dumps(body).encode(),
         headers={
             "Content-Type": "application/json",
-            **({"Authorization": f"Bearer {FACILITATOR_API_KEY}"} if FACILITATOR_API_KEY else {}),
+            "User-Agent": USER_AGENT,
+            **({"Authorization": f"Bearer {key}"} if key else {}),
         },
         method="POST",
     )
@@ -156,6 +249,9 @@ def verify_locally(payment: dict) -> str:
 
     auth = payment["payload"]["authorization"]
     accepted = payment["accepted"]
+    if accepted["network"] == ARC_NETWORK and int(auth["validBefore"]) - int(time.time()) \
+            < int(accepted["maxTimeoutSeconds"]) - 100:
+        raise Refused("authorization_validity_too_short")
     if auth["to"].lower() != PAY_TO.lower():
         raise Refused("authorization pays someone else")
     if str(auth["value"]) != str(int(PRICE_UNITS)):
@@ -188,7 +284,8 @@ def verify_locally(payment: dict) -> str:
             "name": accepted["extra"]["name"],
             "version": accepted["extra"]["version"],
             "chainId": int(accepted["network"].split(":")[1]),
-            "verifyingContract": accepted["asset"],
+            # On Arc the signature is for GatewayWallet, not for the token.
+            "verifyingContract": accepted["extra"].get("verifyingContract", accepted["asset"]),
         },
         "message": {
             "from": auth["from"],
@@ -211,14 +308,31 @@ def verify_locally(payment: dict) -> str:
 def settle(payment: dict, resource_url: str) -> dict:
     """Verify, then settle. Two calls on purpose: settling a payload that would
     not verify burns the facilitator's gas for an error nobody can explain
-    afterwards."""
-    if not FACILITATOR_URL:
-        signer = verify_locally(payment)
-        return {"success": True, "transaction": "", "payer": signer, "dryRun": True}
+    afterwards.
 
+    Arc is the exception: Gateway broadcasts nothing per payment, and its
+    /settle verifies the signature and locks the payer's balance in one step.
+    Circle's documentation says to call settle alone."""
+    entry = chosen(payment, resource_url)
     body = {"x402Version": X402_VERSION,
             "paymentPayload": payment,
-            "paymentRequirements": requirements(resource_url)}
+            "paymentRequirements": entry}
+    if entry["network"] == ARC_NETWORK and os.getenv("ARC_DRY_RUN", "") not in ("1", "true"):
+        # Gateway requires paymentPayload.resource; the spec lets a client omit
+        # it. It is not covered by the signature, so filling it in changes
+        # nothing the payer agreed to.
+        if not payment.get("resource"):
+            body["paymentPayload"] = {**payment, "resource": RESOURCE_INFO(resource_url)}
+        done = _facilitator("/settle", body, base=ARC_GATEWAY_URL)
+        if not done.get("success"):
+            raise Refused(f"gateway refused the payment: {done.get('errorReason')}")
+        return done
+
+    if not FACILITATOR_URL or entry["network"] == ARC_NETWORK:
+        signer = verify_locally(payment)
+        return {"success": True, "transaction": "", "payer": signer, "dryRun": True,
+                "network": entry["network"]}
+
     verdict = _facilitator("/verify", body)
     if not verdict.get("isValid"):
         raise Refused(f"facilitator rejected the payment: {verdict.get('invalidReason')}")
@@ -230,7 +344,9 @@ def response_header(settlement: dict) -> str:
         "x402Version": X402_VERSION,
         "success": bool(settlement.get("success")),
         "transaction": settlement.get("transaction", ""),
-        "network": NETWORK,
+        # The network the payment was made on; on Arc `transaction` is Gateway's
+        # transfer id, since settlement is batched rather than one tx per call.
+        "network": settlement.get("network", NETWORK),
         "payer": settlement.get("payer", ""),
         **({"dryRun": True} if settlement.get("dryRun") else {}),
     })
@@ -311,5 +427,8 @@ if __name__ == "__main__":
     print(f"x402 example server on http://localhost:{PORT}/quote")
     print(f"  free allowance: {FREE_CALLS_PER_DAY} calls per caller")
     print(f"  price: {PRICE_UNITS} units of {ASSET} on {NETWORK} for {CALLS_PER_PAYMENT} calls")
+    if ARC_ENABLED:
+        arc = arc_requirements()
+        print(f"  arc: {'via Circle Gateway, ' + ARC_NETWORK if arc else 'ENABLED but Gateway does not list it'}")
     print(f"  mode: {mode}\n")
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
