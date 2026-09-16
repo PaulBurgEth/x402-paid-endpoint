@@ -2,11 +2,11 @@
 What the endpoint refuses. Run the server first:
 
     X402_PAY_TO=0x000000000000000000000000000000000000dEaD \
-    FREE_CALLS_PER_DAY=1 X402_CALLS_PER_PAYMENT=1 python server.py
+    FREE_CALLS_PER_DAY=1 X402_CALLS_PER_PAYMENT=1 python agents/server.py
 
 then:
 
-    python test_guards.py
+    python agents/test_guards.py
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import json
 import secrets
 import sys
 
-import agent as A
+import pay as A
 
 URL = "http://localhost:8402/quote"
 
